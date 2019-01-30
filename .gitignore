@@ -48,6 +48,16 @@ lib/python/frugalc
 lib/python/dist
 Library/
 
+# Go lib specific
+lib/go/vendor
+lib/go/glide.lock
+examples/go/vendor
+examples/go/glide.lock
+
+# GopherJS lib specific
+lib/gopherjs/vendor
+lib/gopherjs/glide.lock
+
 # Integration tests
 artifacts/
 test/integration/log/*
@@ -59,6 +69,11 @@ test/integration/java/frugal-integration-test/*.jar
 test/integration/python/tornado/gen-py
 test/integration/python/tornado/gen_py_tornado
 test/integration/python/asyncio/gen_py_asyncio
+
+# test reports
+unit_tests_py2.xml
+unit_tests_std_py2.xml
+unit_tests_py3.xml
 
 # Cross-compiled code
 pkg/

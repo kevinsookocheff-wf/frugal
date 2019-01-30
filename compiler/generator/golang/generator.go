@@ -39,6 +39,7 @@ const (
 	frugalImportOption  = "frugal_import"
 	asyncOption         = "async"
 	useVendorOption     = "use_vendor"
+	slimOption          = "slim"
 )
 
 // Generator implements the LanguageGenerator interface for Go.
@@ -203,6 +204,11 @@ func (g *Generator) GenerateConstantsContents(constants []*parser.Constant) erro
 	return nil
 }
 
+// quote creates a Go string literal for a string.
+func (g *Generator) quote(s string) string {
+	return strconv.Quote(s)
+}
+
 // generateConstantValue recursively generates the string representation of
 // a, possibly complex, constant value.
 func (g *Generator) generateConstantValue(t *parser.Type, value interface{}) string {
@@ -239,7 +245,7 @@ func (g *Generator) generateConstantValue(t *parser.Type, value interface{}) str
 		case "bool", "i8", "byte", "i16", "i32", "i64", "double":
 			return fmt.Sprintf("%v", value)
 		case "string":
-			return fmt.Sprintf("%s", strconv.Quote(value.(string)))
+			return g.quote(value.(string))
 		case "binary":
 			return fmt.Sprintf("[]byte(\"%s\")", value)
 		case "list":
@@ -279,8 +285,13 @@ func (g *Generator) generateConstantValue(t *parser.Type, value interface{}) str
 			panic("no struct for type " + underlyingType.Name)
 		}
 
-		contents := ""
-		contents += fmt.Sprintf("&%s{\n", title(s.Name))
+		// Need to extract the package prefix from the underlying type.
+		var packageName string
+		goUnderlyingType := g.getGoTypeFromThriftTypePtr(underlyingType, false)
+		if lastInd := strings.LastIndex(goUnderlyingType, "."); lastInd != -1 {
+			packageName = goUnderlyingType[1 : lastInd+1] // omit *, include .
+		}
+		contents := fmt.Sprintf("&%s{\n", packageName+title(s.Name))
 
 		for _, pair := range value.([]parser.KeyValue) {
 			name := title(pair.KeyToString())
@@ -325,9 +336,7 @@ func (g *Generator) GenerateEnum(enum *parser.Enum) error {
 	contents += fmt.Sprintf("type %s int64\n\n", eName)
 	contents += "const (\n"
 	for _, field := range enum.Values {
-		if field.Comment != nil {
-			contents += g.GenerateInlineComment(field.Comment, "\t")
-		}
+		contents += g.generateCommentWithDeprecated(field.Comment, "\t", field.Annotations)
 		contents += fmt.Sprintf("\t%s_%s %s = %d\n", eName, field.Name, eName, field.Value)
 	}
 	contents += ")\n\n"
@@ -352,34 +361,36 @@ func (g *Generator) GenerateEnum(enum *parser.Enum) error {
 	contents += fmt.Sprintf("\treturn %s(0), fmt.Errorf(\"not a valid %s string\")\n", eName, eName)
 	contents += "}\n\n"
 
-	contents += fmt.Sprintf("func (p %s) MarshalText() ([]byte, error) {\n", eName)
-	contents += "\treturn []byte(p.String()), nil\n"
-	contents += "}\n\n"
+	if !g.generateSlim() {
+		contents += fmt.Sprintf("func (p %s) MarshalText() ([]byte, error) {\n", eName)
+		contents += "\treturn []byte(p.String()), nil\n"
+		contents += "}\n\n"
 
-	contents += fmt.Sprintf("func (p *%s) UnmarshalText(text []byte) error {\n", eName)
-	contents += fmt.Sprintf("\tq, err := %sFromString(string(text))\n", eName)
-	contents += "\tif err != nil {\n"
-	contents += "\t\treturn err\n"
-	contents += "\t}\n"
-	contents += "\t*p = q\n"
-	contents += "\treturn nil\n"
-	contents += "}\n\n"
+		contents += fmt.Sprintf("func (p *%s) UnmarshalText(text []byte) error {\n", eName)
+		contents += fmt.Sprintf("\tq, err := %sFromString(string(text))\n", eName)
+		contents += "\tif err != nil {\n"
+		contents += "\t\treturn err\n"
+		contents += "\t}\n"
+		contents += "\t*p = q\n"
+		contents += "\treturn nil\n"
+		contents += "}\n\n"
 
-	contents += fmt.Sprintf("func (p *%s) Scan(value interface{}) error {\n", eName)
-	contents += "\tv, ok := value.(int64)\n"
-	contents += "\tif !ok {\n"
-	contents += "\t\treturn errors.New(\"Scan value is not int64\")\n"
-	contents += "\t}\n"
-	contents += fmt.Sprintf("\t*p = %s(v)\n", eName)
-	contents += fmt.Sprintf("\treturn nil\n")
-	contents += "}\n\n"
+		contents += fmt.Sprintf("func (p *%s) Scan(value interface{}) error {\n", eName)
+		contents += "\tv, ok := value.(int64)\n"
+		contents += "\tif !ok {\n"
+		contents += "\t\treturn errors.New(\"Scan value is not int64\")\n"
+		contents += "\t}\n"
+		contents += fmt.Sprintf("\t*p = %s(v)\n", eName)
+		contents += fmt.Sprintf("\treturn nil\n")
+		contents += "}\n\n"
 
-	contents += fmt.Sprintf("func (p *%s) Value() (driver.Value, error) {\n", eName)
-	contents += "\tif p == nil {\n"
-	contents += "\t\treturn nil, nil\n"
-	contents += "\t}\n"
-	contents += "\treturn int64(*p), nil\n"
-	contents += "}\n\n"
+		contents += fmt.Sprintf("func (p *%s) Value() (driver.Value, error) {\n", eName)
+		contents += "\tif p == nil {\n"
+		contents += "\t\treturn nil, nil\n"
+		contents += "\t}\n"
+		contents += "\treturn int64(*p), nil\n"
+		contents += "}\n\n"
+	}
 
 	_, err := g.typesFile.WriteString(contents)
 	return err
@@ -437,6 +448,24 @@ func (g *Generator) generateStruct(s *parser.Struct, serviceName string) string 
 	return contents
 }
 
+func (g *Generator) generateCommentWithDeprecated(comment []string, indent string, anns parser.Annotations) string {
+	contents := ""
+	if comment != nil {
+		contents += g.GenerateInlineComment(comment, indent)
+	}
+
+	deprecationValue, deprecated := anns.Deprecated()
+	if deprecated && deprecationValue != "" {
+		if deprecationValue == "" {
+			contents += indent + "// Deprecated\n"
+		} else {
+			contents += fmt.Sprintf("%s// Deprecated: %s\n", indent, deprecationValue)
+		}
+	}
+
+	return contents
+}
+
 func (g *Generator) generateStructDeclaration(s *parser.Struct, sName string) string {
 	contents := ""
 	if s.Comment != nil {
@@ -450,21 +479,22 @@ func (g *Generator) generateStructDeclaration(s *parser.Struct, sName string) st
 		fName := title(field.Name)
 		// All fields in a union are marked optional by default
 
-		if field.Comment != nil {
-			contents += g.GenerateInlineComment(field.Comment, "\t")
-		}
+		contents += g.generateCommentWithDeprecated(field.Comment, "\t", field.Annotations)
 
-		// Use the actual field name for annotations because the serialized
-		// name needs to be the same for all languages
-		thriftAnnotation := fmt.Sprintf("%s,%d", field.Name, field.ID)
-		if field.Modifier == parser.Required {
-			thriftAnnotation += ",required"
+		var annotation string
+		if !g.generateSlim() {
+			// Use the actual field name for annotations because the serialized
+			// name needs to be the same for all languages
+			thriftAnnotation := fmt.Sprintf("%s,%d", field.Name, field.ID)
+			if field.Modifier == parser.Required {
+				thriftAnnotation += ",required"
+			}
+			jsonAnnotation := field.Name
+			if field.Modifier == parser.Optional {
+				jsonAnnotation += ",omitempty"
+			}
+			annotation = fmt.Sprintf("`thrift:\"%s\" db:\"%s\" json:\"%s\"`", thriftAnnotation, field.Name, jsonAnnotation)
 		}
-		jsonAnnotation := field.Name
-		if field.Modifier == parser.Optional {
-			jsonAnnotation += ",omitempty"
-		}
-		annotation := fmt.Sprintf("`thrift:\"%s\" db:\"%s\" json:\"%s\"`", thriftAnnotation, field.Name, jsonAnnotation)
 
 		goType := g.getGoTypeFromThriftTypePtr(field.Type, g.isPointerField(field))
 		contents += fmt.Sprintf("\t%s %s %s\n", fName, goType, annotation)
@@ -593,9 +623,13 @@ func (g *Generator) generateRead(s *parser.Struct, sName string) string {
 		contents += "\t\tswitch fieldId {\n"
 		for _, field := range s.Fields {
 			contents += fmt.Sprintf("\t\tcase %d:\n", field.ID)
-			contents += fmt.Sprintf("\t\t\tif err := p.ReadField%d(iprot); err != nil {\n", field.ID)
-			contents += "\t\t\t\treturn err\n"
-			contents += "\t\t\t}\n"
+			if g.generateSlim() {
+				contents += g.generateReadFieldRec(field, true)
+			} else {
+				contents += fmt.Sprintf("\t\t\tif err := p.ReadField%d(iprot); err != nil {\n", field.ID)
+				contents += "\t\t\t\treturn err\n"
+				contents += "\t\t\t}\n"
+			}
 			if field.Modifier == parser.Required {
 				contents += fmt.Sprintf("\t\t\tisset%s = true\n", title(field.Name))
 			}
@@ -619,7 +653,7 @@ func (g *Generator) generateRead(s *parser.Struct, sName string) string {
 		if field.Modifier == parser.Required {
 			fName := title(field.Name)
 			contents += fmt.Sprintf("\tif !isset%s {\n", fName)
-			errorMessage := fmt.Sprintf("Required field %s is not set", fName)
+			errorMessage := fmt.Sprintf("Required field '%s' is not present in struct '%s'", fName, s.Name)
 			contents += fmt.Sprintf("\t\treturn thrift.NewTProtocolExceptionWithType(thrift.INVALID_DATA, fmt.Errorf(\"%s\"))\n", errorMessage)
 			contents += "\t}\n"
 		}
@@ -635,16 +669,16 @@ func (g *Generator) generateRead(s *parser.Struct, sName string) string {
 	contents += "\treturn nil\n"
 	contents += "}\n\n"
 
-	for _, field := range s.Fields {
-		contents += g.generateReadField(sName, field)
+	if !g.generateSlim() {
+		for _, field := range s.Fields {
+			contents += g.generateReadField(sName, field)
+		}
 	}
 	return contents
 }
 
 func (g *Generator) generateWrite(s *parser.Struct, sName string) string {
-	contents := ""
-
-	contents += fmt.Sprintf("func (p *%s) Write(oprot thrift.TProtocol) error {\n", sName)
+	contents := fmt.Sprintf("func (p *%s) Write(oprot thrift.TProtocol) error {\n", sName)
 
 	// Only one field can be set for a union, make sure that's the case
 	if s.Type == parser.StructTypeUnion {
@@ -659,9 +693,7 @@ func (g *Generator) generateWrite(s *parser.Struct, sName string) string {
 	contents += "\t}\n"
 
 	for _, field := range s.Fields {
-		contents += fmt.Sprintf("\tif err := p.writeField%d(oprot); err != nil {\n", field.ID)
-		contents += "\t\treturn err\n"
-		contents += "\t}\n"
+		contents += g.generateWriteFieldInline(field)
 	}
 
 	contents += "\tif err := oprot.WriteFieldStop(); err != nil{\n"
@@ -876,7 +908,66 @@ func (g *Generator) generateReadFieldRec(field *parser.Field, first bool) string
 	return contents
 }
 
+func (g *Generator) skipStandaloneFieldHandler(field *parser.Field) bool {
+	if !g.generateSlim() {
+		return false
+	}
+	baseType := g.Frugal.UnderlyingType(field.Type)
+	isStruct := g.Frugal.IsStruct(baseType)
+	return baseType.IsPrimitive() || isStruct || g.Frugal.IsEnum(baseType)
+}
+
+func (g *Generator) generateWriteFieldInline(field *parser.Field) (contents string) {
+	if !g.skipStandaloneFieldHandler(field) {
+		return fmt.Sprintf("\tif err := p.writeField%d(oprot); err != nil {\n\t\treturn err\n\t}\n", field.ID)
+	}
+
+	// Check if this field is optional and add nil checks if we need them.
+	var indent string
+	var tail string
+	if field.Modifier == parser.Optional {
+		indent = "\t"
+		tail = "\t\t}\n"
+		contents += fmt.Sprintf("\tif p.IsSet%s() {\n", snakeToCamel(field.Name))
+	}
+
+	// Get the write function we need to invoke
+	baseType := g.Frugal.UnderlyingType(field.Type)
+	writeMethod := snakeToCamel(baseType.Name)
+	if g.Frugal.IsStruct(baseType) {
+		writeMethod = "Struct"
+	} else if g.Frugal.IsEnum(baseType) {
+		writeMethod = "I32"
+	}
+
+	// Get appropriate way to reference struct field
+	fieldName := snakeToCamel(field.Name)
+	structField := "p." + fieldName
+
+	// The Thrift generator uses a convention of appending a suffix of '_'
+	// if the argument starts with 'New', ends with 'Result' or ends with 'Args'.
+	// This effort must be duplicated to correctly reference Thrift generated code.
+	if strings.HasPrefix(fieldName, "New") || strings.HasSuffix(fieldName, "Result") || strings.HasSuffix(fieldName, "Args") {
+		structField += "_"
+	}
+
+	if g.isPointerField(field) && !g.Frugal.IsStruct(baseType) { // don't dereference structs
+		structField = "*" + structField
+	}
+	if g.Frugal.IsEnum(baseType) || (g.isPrimitive(baseType) && !field.Type.IsPrimitive()) {
+		structField = g.getGoTypeFromThriftTypeEnum(baseType) + "(" + structField + ")" // add type casts
+	}
+
+	// Actually generate the write block
+	contents += indent + fmt.Sprintf("\tif err := frugal.Write%s(oprot, %s, \"%s\", %d); err != nil {\n", writeMethod, structField, field.Name, field.ID)
+	contents += indent + fmt.Sprintf("\t\treturn thrift.PrependError(fmt.Sprintf(\"%%T::%s:%d \", p), err)", field.Name, field.ID)
+	return contents + tail + "\t}\n"
+}
+
 func (g *Generator) generateWriteField(structName string, field *parser.Field) string {
+	if g.skipStandaloneFieldHandler(field) {
+		return ""
+	}
 	contents := ""
 	fName := title(field.Name)
 
@@ -1011,6 +1102,11 @@ func (g *Generator) GenerateTypesImports(file *os.File) error {
 	} else {
 		contents += "\t\"git.apache.org/thrift.git/lib/go/thrift\"\n"
 	}
+	if g.Options[frugalImportOption] != "" {
+		contents += "\t\"" + g.Options[frugalImportOption] + "\"\n"
+	} else {
+		contents += "\t\"github.com/Workiva/frugal/lib/go\"\n"
+	}
 
 	protections := ""
 	pkgPrefix := g.Options[packagePrefixOption]
@@ -1024,12 +1120,15 @@ func (g *Generator) GenerateTypesImports(file *os.File) error {
 	}
 
 	contents += ")\n\n"
-	contents += "// (needed to ensure safety because of naive import list construction.)\n"
-	contents += "var _ = thrift.ZERO\n"
-	contents += "var _ = fmt.Printf\n"
-	contents += "var _ = bytes.Equal\n\n"
-	contents += protections
-	contents += "var GoUnusedProtection__ int\n"
+
+	if !g.generateSlim() {
+		contents += "// (needed to ensure safety because of naive import list construction.)\n"
+		contents += "var _ = thrift.ZERO\n"
+		contents += "var _ = fmt.Printf\n"
+		contents += "var _ = bytes.Equal\n\n"
+		contents += protections
+		contents += "var GoUnusedProtection__ int\n"
+	}
 	_, err := file.WriteString(contents)
 	return err
 }
@@ -1059,11 +1158,14 @@ func (g *Generator) GenerateServiceResultArgsImports(file *os.File) error {
 	}
 
 	contents += ")\n\n"
-	contents += "// (needed to ensure safety because of naive import list construction.)\n"
-	contents += "var _ = thrift.ZERO\n"
-	contents += "var _ = fmt.Printf\n"
-	contents += "var _ = bytes.Equal\n\n"
-	contents += protections
+
+	if !g.generateSlim() {
+		contents += "// (needed to ensure safety because of naive import list construction.)\n"
+		contents += "var _ = thrift.ZERO\n"
+		contents += "var _ = fmt.Printf\n"
+		contents += "var _ = bytes.Equal\n\n"
+		contents += protections
+	}
 
 	_, err := file.WriteString(contents)
 	return err
@@ -1106,11 +1208,13 @@ func (g *Generator) GenerateServiceImports(file *os.File, s *parser.Service) err
 
 	imports += ")\n\n"
 
-	imports += "// (needed to ensure safety because of naive import list construction.)\n"
-	imports += "var _ = thrift.ZERO\n"
-	imports += "var _ = fmt.Printf\n"
-	imports += "var _ = bytes.Equal\n"
-	imports += "var _ = logrus.DebugLevel"
+	if !g.generateSlim() {
+		imports += "// (needed to ensure safety because of naive import list construction.)\n"
+		imports += "var _ = thrift.ZERO\n"
+		imports += "var _ = fmt.Printf\n"
+		imports += "var _ = bytes.Equal\n"
+		imports += "var _ = logrus.DebugLevel"
+	}
 
 	_, err = file.WriteString(imports)
 	return err
@@ -1157,7 +1261,7 @@ func (g *Generator) generateIncludeImport(include *parser.Include, pkgPrefix str
 	namespace := g.Frugal.NamespaceForInclude(includeName, lang)
 
 	_, vendored := include.Annotations.Vendor()
-	vendored = vendored && g.useVendor()
+	vendored = vendored && g.UseVendor()
 	vendorPath := ""
 
 	if namespace != nil {
@@ -1513,14 +1617,7 @@ func (g *Generator) generateServiceInterface(service *parser.Service) string {
 		contents += fmt.Sprintf("\t%s\n\n", g.getServiceExtendsName(service))
 	}
 	for _, method := range service.Methods {
-		if method.Comment != nil {
-			contents += g.GenerateInlineComment(method.Comment, "\t")
-		}
-
-		if _, ok := method.Annotations.Deprecated(); ok {
-			contents += "\t// Deprecated\n"
-		}
-
+		contents += g.generateCommentWithDeprecated(method.Comment, "\t", method.Annotations)
 		contents += fmt.Sprintf("\t%s(ctx frugal.FContext%s) %s\n",
 			snakeToCamel(method.Name), g.generateInterfaceArgs(method.Arguments),
 			g.generateReturnArgs(method))
@@ -1676,7 +1773,7 @@ func (g *Generator) generateClientMethod(service *parser.Service, method *parser
 	contents += fmt.Sprintf("func (f *F%sClient) %s(ctx frugal.FContext%s) %s {\n",
 		servTitle, nameTitle, g.generateInputArgs(method.Arguments), g.generateReturnArgs(method))
 
-	if deprecated {
+	if deprecated && !g.generateSlim() {
 		contents += fmt.Sprintf("\tlogrus.Warn(\"Call to deprecated function '%s.%s'\")\n", service.Name, nameTitle)
 	}
 
@@ -1689,7 +1786,9 @@ func (g *Generator) generateClientMethod(service *parser.Service, method *parser
 	contents += fmt.Sprintf("\t\tpanic(fmt.Sprintf(\"Middleware returned %%d arguments, expected %s\", len(ret)))\n", numReturn)
 	contents += "\t}\n"
 	if method.ReturnType != nil {
-		contents += fmt.Sprintf("\tr = ret[0].(%s)\n", g.getGoTypeFromThriftType(method.ReturnType))
+		contents += "\tif ret[0] != nil {\n"
+		contents += fmt.Sprintf("\t\tr = ret[0].(%s)\n", g.getGoTypeFromThriftType(method.ReturnType))
+		contents += "\t}\n"
 		contents += "\tif ret[1] != nil {\n"
 		contents += "\t\terr = ret[1].(error)\n"
 		contents += "\t}\n"
@@ -1854,7 +1953,7 @@ func (g *Generator) generateProcessor(service *parser.Service) string {
 		if len(method.Annotations) > 0 {
 			contents += fmt.Sprintf("\tp.AddToAnnotationsMap(\"%s\", map[string]string{\n", methodLower)
 			for _, annotation := range method.Annotations {
-				contents += fmt.Sprintf("\t\t\"%s\": \"%s\",\n", annotation.Name, annotation.Value)
+				contents += fmt.Sprintf("\t\t\"%s\": %s,\n", annotation.Name, g.quote(annotation.Value))
 			}
 			contents += "\t})\n"
 		}
@@ -1880,7 +1979,7 @@ func (g *Generator) generateMethodProcessor(service *parser.Service, method *par
 
 	contents += fmt.Sprintf("func (p *%sF%s) Process(ctx frugal.FContext, iprot, oprot *frugal.FProtocol) error {\n", servLower, nameTitle)
 
-	if _, ok := method.Annotations.Deprecated(); ok {
+	if _, ok := method.Annotations.Deprecated(); ok && !g.generateSlim() {
 		contents += fmt.Sprintf("\tlogrus.Warn(\"Deprecated function '%s.%s' was called by a client\")\n", service.Name, nameTitle)
 	}
 
@@ -2007,7 +2106,7 @@ func (g *Generator) generateScopeArgs(scope *parser.Scope) string {
 func (g *Generator) generateHandlerArgs(method *parser.Method) string {
 	args := "[]interface{}{ctx"
 	for _, arg := range method.Arguments {
-		args += ", args." + snakeToCamel(arg.Name)
+		args += ", args." + title(arg.Name)
 	}
 	args += "}"
 	return args
@@ -2090,7 +2189,7 @@ func (g *Generator) generateInputArgs(args []*parser.Field) string {
 func (g *Generator) generateStructArgs(args []*parser.Field) string {
 	argStr := ""
 	for _, arg := range args {
-		argStr += "\t\t" + snakeToCamel(arg.Name) + ": " + strings.ToLower(arg.Name) + ",\n"
+		argStr += "\t\t" + title(arg.Name) + ": " + strings.ToLower(arg.Name) + ",\n"
 	}
 	return argStr
 }
@@ -2139,6 +2238,33 @@ func (g *Generator) getGoTypeFromThriftTypePtr(t *parser.Type, pointer bool) str
 			return "*" + name
 		}
 		return maybePointer + name
+	}
+}
+
+func (g *Generator) getGoTypeFromThriftTypeEnum(typ *parser.Type) string {
+	switch typ.Name {
+	// Just typecast everything to get around typedefs
+	case "bool":
+		return "bool"
+	case "byte", "i8":
+		return "int8"
+	case "i16":
+		return "int16"
+	case "i32":
+		return "int32"
+	case "i64":
+		return "int64"
+	case "double":
+		return "float64"
+	case "string":
+		return "string"
+	case "binary":
+		return "[]byte"
+	default:
+		if g.Frugal.IsEnum(typ) {
+			return "int32"
+		}
+		panic("unknown thrift type: " + typ.Name)
 	}
 }
 
@@ -2244,7 +2370,12 @@ func (g *Generator) generateAsync() bool {
 	return ok
 }
 
-func (g *Generator) useVendor() bool {
+func (g *Generator) generateSlim() bool {
+	_, ok := g.Options[slimOption]
+	return ok
+}
+
+func (g *Generator) UseVendor() bool {
 	_, ok := g.Options[useVendorOption]
 	return ok
 }
@@ -2262,6 +2393,10 @@ func includeNameToReference(includeName string) string {
 
 // snakeToCamel returns a string converted from snake case to uppercase.
 func snakeToCamel(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+
 	var result string
 
 	words := strings.Split(s, "_")
@@ -2297,19 +2432,7 @@ func titleServiceName(name string, serviceName string) string {
 	if serviceName != "" {
 		name = fmt.Sprintf("%s_%s", serviceName, name)
 	}
-	var result string
-	words := strings.Split(name, "_")
-
-	for _, word := range words {
-		if upper := strings.ToUpper(word); commonInitialisms[upper] {
-			result += upper
-			continue
-		}
-
-		w := []rune(word)
-		w[0] = unicode.ToUpper(w[0])
-		result += string(w)
-	}
+	result := snakeToCamel(name)
 
 	if (serviceName == "") && (strings.HasPrefix(result, "New") || strings.HasSuffix(result, "Args") || strings.HasSuffix(result, "Result")) {
 		result += "_"

@@ -33,28 +33,28 @@ releases tab. Currently, adding these binaries is a manual process. If
 a downloadable release is missing, notify the messaging team to have it
 added.
 
+If go is already installed and setup you can also simply:
+
+```bash
+$ go get github.com/Workiva/frugal
+```
+
 ### From Source
-
+**Our usage of godep has been deprecated as we move to glide. Once the deprecation period is over, we will remove both the Godeps/ and vendor/ folder, relying solely on glide for dependency management**
 1.  Install [go](https://golang.org/doc/install) and setup [`GOPATH`](https://github.com/golang/go/wiki/GOPATH).
-1.  Install [godep](https://github.com/tools/godep).
-1.  Get the frugal source code
+1.  Clone the frugal repo
 
     ```bash
-    $ go get github.com/Workiva/frugal
-    ```
-
-    Or you can manually clone the frugal repo
-
-    ```bash
-    $ mkdir -p $GOPATH/src/github.com/Workiva/
-    $ cd $GOPATH/src/github.com/Workiva
+    $ mkdir -p $GOPATH/src/github.com/Workiva && cd $_
     $ git clone git@github.com:Workiva/frugal.git
     ```
 
-1.  Install frugal with godep
+1.  Install the CLI binary
     ```bash
     $ cd $GOPATH/src/github.com/Workiva/frugal
-    $ godep go install
+    $ curl https://glide.sh/get | sh  # get glide if necessary
+    $ glide install  # get dependencies
+    $ go install
     ```
 
 When generating go, be aware the frugal go library and the frugal compiler
@@ -215,7 +215,7 @@ Some common annotations are listed below
 | Annotation    | Values        | Allowed Places | Description
 | ------------- | ------------- | -------------- | -----------
 | vendor        | Optional location | Namespaces, Includes | See [vendoring includes](#vendoring-includes)
-| deprecated    | Optional description | Service methods | Marks a method as deprecated (if supported by the language) and logs a warning if the method is called.
+| deprecated    | Optional description | Service methods, Struct/union/exception fields | See [deprecating](#deprecating)
 
 ### Vendoring Includes
 
@@ -241,7 +241,7 @@ intention to use the vendored code as advertised by the `vendor` annotation.
 If no location is specified by the `vendor` annotation, the behavior is defined
 by the language generator.
 
-The `vendor` annotation is currently only supported by Go and Dart.
+The `vendor` annotation is currently only supported by Go, Dart and Java.
 
 The example below illustrates how this works.
 
@@ -249,6 +249,7 @@ bar.frugal ("providing" IDL):
 ```thrift
 namespace go bar (vendor="github.com/Workiva/my-repo/gen-go/bar")
 namespace dart bar (vendor="my-repo/gen-go")
+namespace java bar (vendor="com.workiva.bar.custom.pkg")
 
 struct Struct {}
 ```
@@ -271,6 +272,35 @@ generate code for `bar.frugal` since `use_vendor` is set and the "providing"
 IDL has a vendor path set for the Go namespace. Instead, the generated code for
 `foo.frugal` will reference the vendor path specified in `bar.frugal`
 (github.com/Workiva/my-repo/gen-go/bar).
+
+### Deprecating
+Marks a method or field as deprecated (if supported by the language, or in a comment otherwise), and logs a warning if a deprecated method is called. This is not available on an entire struct, only the fields within the struct.
+```
+  Struct GetFooRequest {
+      1: String value (deprecated="Use newValue instead")
+  }
+
+  GetFooResponse getFoo(10: GetFooRequest request) throws (
+    1: FooError error
+  ) (deprecated="Use getBar instead")
+```
+In Dart, this compiles to
+```
+class GetFooRequest implements thrift.TBase {
+  ...
+
+  /// Deprecated: Use newValue instead
+  @deprecated
+  List<String> _value;
+  ...
+}
+```
+
+```
+  /// Deprecated: Use getBar instead
+  @deprecated
+  Future<namespace.GetFooResponse> getFoo(frugal.FContext ctx, namespace.GetFooRequest request);
+```
 
 
 ## Thrift Parity

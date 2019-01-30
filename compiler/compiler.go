@@ -22,6 +22,7 @@ import (
 	"github.com/Workiva/frugal/compiler/generator"
 	"github.com/Workiva/frugal/compiler/generator/dartlang"
 	"github.com/Workiva/frugal/compiler/generator/golang"
+	"github.com/Workiva/frugal/compiler/generator/gopherjs"
 	"github.com/Workiva/frugal/compiler/generator/html"
 	"github.com/Workiva/frugal/compiler/generator/java"
 	"github.com/Workiva/frugal/compiler/generator/python"
@@ -127,7 +128,12 @@ func generateFrugalRec(f *parser.Frugal, g generator.ProgramGenerator, generate 
 
 	// Iterate through includes in order to ensure determinism in
 	// generated code.
-	for _, inclFrugal := range f.OrderedIncludes() {
+	for _, include := range f.OrderedIncludes() {
+		// Skip recursive generation if include is marked vendor and use_vendor option is enabled
+		if _, vendored := include.Annotations.Vendor(); vendored && g.UseVendor() {
+			continue
+		}
+		inclFrugal := f.ParsedIncludes[include.Name]
 		if err := generateFrugalRec(inclFrugal, g, globals.Recurse, lang); err != nil {
 			return err
 		}
@@ -152,6 +158,11 @@ func getProgramGenerator(lang string, options map[string]string) (generator.Prog
 		}
 
 		g = generator.NewProgramGenerator(golang.NewGenerator(options), false)
+	case "gopherjs":
+		if pkg := options["package_prefix"]; pkg != "" && !strings.HasSuffix(pkg, "/") {
+			options["package_prefix"] += "/" // Make sure the package prefix ends with a "/"
+		}
+		g = generator.NewProgramGenerator(gopherjs.NewGenerator(options), false)
 	case "java":
 		g = generator.NewProgramGenerator(java.NewGenerator(options), true)
 	case "py":

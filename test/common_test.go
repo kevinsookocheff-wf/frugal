@@ -110,14 +110,24 @@ func copyFilePair(pair FileComparisonPair) error {
 	}
 	defer generatedFile.Close()
 
-	expectedFile, err := os.OpenFile(pair.ExpectedPath, os.O_RDWR, os.ModePerm)
+	expectedFile, err := os.Create(pair.ExpectedPath)
 	if err != nil {
 		return err
 	}
 	defer expectedFile.Close()
-	// In case lines were removed
-	expectedFile.Truncate(0)
 
 	_, err = io.Copy(expectedFile, generatedFile)
 	return err
+}
+
+func assertFilesNotExist(t *testing.T, filePaths []string) {
+	for _, fileThatShouldNotExist := range filePaths {
+		if _, err := os.Stat(fileThatShouldNotExist); !os.IsNotExist(err) {
+			if err != nil {
+				t.Errorf("Unexpected error checking for existence on %q: %s", fileThatShouldNotExist, err)
+			} else {
+				t.Errorf("Expected %q not to exist, but it did", fileThatShouldNotExist)
+			}
+		}
+	}
 }
